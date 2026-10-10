@@ -27,7 +27,11 @@ import { mintBatchFriendlyId } from "~/v3/runOpsMigration/mintBatchFriendlyId.se
 import { batchTriggerWorker } from "../batchTriggerWorker.server";
 import { guardQueueSizeLimitsForEnv } from "../queueSizeLimits.server";
 import { downloadPacketFromObjectStore, uploadPacketToObjectStore } from "../objectStore.server";
-import { isFinalAttemptStatus, isFinalRunStatus } from "../taskStatus";
+import {
+  isFinalAttemptStatus,
+  isFinalRunStatus,
+  shouldIdempotencyKeyBeCleared,
+} from "../taskStatus";
 import { startActiveSpan } from "../tracer.server";
 import { BaseService, ServiceValidationError } from "./baseService.server";
 import { OutOfEntitlementError, TriggerTaskService } from "./triggerTask.server";
@@ -442,6 +446,10 @@ export class BatchTriggerV3Service extends BaseService {
     // Build the run IDs in order: reuse an unexpired cached id, else mint a new id (and record any
     // expired cached id so its idempotency key can be cleared below).
     const expiredRunIds = new Set<string>();
+    // Dedupes replacement ids when multiple batch items share
+    // (taskIdentifier, idempotencyKey) and the cached run must be cleared.
+    // See the fuller explanation inside the loop below.
+    const replacementIdsByKey = new Map<string, string>();
 
     const runs = await Promise.all(
       body.items.map(async (item) => {
@@ -450,13 +458,55 @@ export class BatchTriggerV3Service extends BaseService {
         );
 
         if (cachedRun) {
-          if (cachedRun.idempotencyKeyExpiresAt && cachedRun.idempotencyKeyExpiresAt < new Date()) {
+          // Clear the idempotency key and mint a fresh run when either:
+          //   (a) the key's time-based expiry has passed, OR
+          //   (b) the previous run ended in a terminal failure state the
+          //       single-trigger path treats as "retry allowed"
+          //       (INTERRUPTED, COMPLETED_WITH_ERRORS, SYSTEM_FAILURE,
+          //       CRASHED, TIMED_OUT, plus EXPIRED — see
+          //       `shouldIdempotencyKeyBeCleared` in `taskStatus.ts`).
+          //
+          // Before this fix, batchTrigger only checked (a). A failed run
+          // with the same idempotency key was returned as `isCached: true`,
+          // silently handing the caller back a dead run that would never
+          // produce output (issue #4819). This mirrors the single-trigger
+          // behaviour at IdempotencyKeyConcern.handleExistingRun
+          // (idempotencyKeys.server.ts:463).
+          const expired =
+            cachedRun.idempotencyKeyExpiresAt &&
+            cachedRun.idempotencyKeyExpiresAt < new Date();
+          const failed = shouldIdempotencyKeyBeCleared(cachedRun.status);
+
+          if (expired || failed) {
             expiredRunIds.add(cachedRun.friendlyId);
 
+            // When two batch items share (task, idempotencyKey) AND the
+            // cached run is cleared, downstream processing creates only ONE
+            // run per key (TriggerTaskService.call honours the key and
+            // reuses the first fresh run for every subsequent item).
+            // Allocating distinct minted ids per item left the response
+            // referencing ghost ids. Reuse the first replacement id for
+            // every item sharing a (task, key). This also fixes the
+            // pre-existing time-expiration branch. (Devin review on #5014.)
+            const idemKey = item.options?.idempotencyKey;
+            let replacementId: string | undefined = idemKey
+              ? replacementIdsByKey.get(`${item.task} ${idemKey}`)
+              : undefined;
+            if (!replacementId) {
+              replacementId = await this.mintChildFriendlyId(
+                environment,
+                childAnchor,
+                item.options?.region
+              );
+              if (idemKey) {
+                replacementIdsByKey.set(`${item.task} ${idemKey}`, replacementId);
+              }
+            }
+
             return {
-              id: await this.mintChildFriendlyId(environment, childAnchor, item.options?.region),
+              id: replacementId,
               isCached: false,
-              idempotencyKey: item.options?.idempotencyKey ?? undefined,
+              idempotencyKey: idemKey ?? undefined,
               taskIdentifier: item.task,
             };
           }
